@@ -85,6 +85,19 @@ type Quirks struct {
 	// model-id naming. Some providers expose Responses-only model catalogs
 	// whose slugs do not contain "codex".
 	ForceResponsesAPI bool
+	// ResponsesAPIModelIDs names the model ids that must go through the
+	// Responses API on a gateway that serves both wires and picks between them
+	// per model, where the id gives no hint: OpenCode Go answers
+	// `400 ModelProtocolUnsupported` to a Chat Completions call for
+	// "grok-4.6" and serves it on Responses, and the id is neither a codex
+	// slug nor an OpenAI generation, so IsResponsesAPIModel cannot see it.
+	//
+	// Data rather than a naming rule, because the split is per model, not per
+	// vendor: the same gateway serves some families on one wire and some on the
+	// other, and a gateway that changes its mind says so with a 400 rather than
+	// silently answering. A wrong guess is therefore loud, but only a listed id
+	// routes correctly, so a new Responses-only id has to be added here.
+	ResponsesAPIModelIDs map[string]bool
 
 	// OmitResponsesMaxOutputTokens drops the `max_output_tokens` field from
 	// Responses requests. The ChatGPT Codex backend
@@ -94,17 +107,31 @@ type Quirks struct {
 	// default and is enabled only for the Codex-plan provider.
 	OmitResponsesMaxOutputTokens bool
 
-	// SessionAffinityHeader sends a stable per-conversation `session_id`
-	// header on Responses requests. The ChatGPT Codex backend
-	// (chatgpt.com/backend-api/codex/responses) keys its cache-affinity
-	// routing on this header, NOT on prompt_cache_key: live A/B probing
-	// measured a 26–40% prompt-cache miss rate on rapid consecutive requests
-	// without it and 0 misses in 52 rounds with it (originator / OpenAI-Beta
-	// headers had no effect).
+	// SessionAffinityHeader is the NAME of the request header that carries a
+	// stable per-conversation session id, "" for none. It rides both wire
+	// paths — Responses and Chat Completions — so the id is present whichever
+	// protocol a descriptor routes to.
 	//
-	// That number is a measurement of that one backend, not a general OpenAI
-	// result, so this is deliberately off everywhere else — including the
-	// first-party Platform provider talking to api.openai.com:
+	// The ChatGPT Codex backend (chatgpt.com/backend-api/codex/responses) keys
+	// its cache-affinity routing on a `session_id` header, NOT on
+	// prompt_cache_key: live A/B probing measured a 26–40% prompt-cache miss
+	// rate on rapid consecutive requests without it and 0 misses in 52 rounds
+	// with it (originator / OpenAI-Beta headers had no effect). There the
+	// quirk is an optimisation; for the Codex-plan provider, whose CLI always
+	// sends it, it is set to "session_id".
+	//
+	// OpenCode Go (opencode.ai/zen/go/v1) makes a header of the same kind
+	// mandatory in practice: its documentation asks every client to send a
+	// stable session id in `x-opencode-session` "so we can optimize routing and
+	// prompt caching", and measured, a request without it is refused outright —
+	// 400 {"type":"error","error":{"type":"MissingSessionID"}} on the Chat
+	// Completions path (probed 2026-09-27), so there the quirk is a
+	// requirement rather than an optimisation.
+	//
+	// That Codex number is a measurement of that one backend, not a general
+	// OpenAI result, so this is deliberately unset everywhere else —
+	// including the first-party Platform provider talking to
+	// api.openai.com:
 	//   - The Platform API's documented cache-routing control is the
 	//     prompt_cache_key request field: a request is routed to a cache
 	//     machine by that key, with the prompt prefix hash as the secondary
@@ -114,14 +141,12 @@ type Quirks struct {
 	//   - No OpenAI-documented request header affects cache routing at all.
 	//     `session_id` is absent from the Platform header contract, so there
 	//     is no documented behaviour to switch on there.
-	//   - The underscore in the name makes it actively risky on the
-	//     OpenAI-compatible and local providers: nginx treats underscored
-	//     request headers as invalid and drops them by default
-	//     (underscores_in_headers off), and Envoy can be configured to
-	//     reject the request outright with a 400, so an upstream sitting
-	//     behind such a gateway breaks for no gain.
-	// Enabled for the Codex-plan provider, whose CLI always sends it.
-	SessionAffinityHeader bool
+	//   - An underscored name is actively risky on the OpenAI-compatible and
+	//     local providers: nginx treats underscored request headers as invalid
+	//     and drops them by default (underscores_in_headers off), and Envoy
+	//     can be configured to reject the request outright with a 400, so an
+	//     upstream sitting behind such a gateway breaks for no gain.
+	SessionAffinityHeader string
 
 	// IncludePresencePenalty / IncludeFrequencyPenalty send the named
 	// penalty params even when they would be zero. Most vendors silently
@@ -191,6 +216,10 @@ type Client struct {
 	// once at construction from the descriptor's ServiceTierSpecFn. Zero value ⇒
 	// standard serving only (the request omits the service_tier param).
 	serviceTierSpec ServiceTierSpec
+	// modelResponsesAPI is whether this model's id is listed in
+	// Quirks.ResponsesAPIModelIDs, resolved once at construction because the
+	// model cannot change on a client. See usesResponsesAPI.
+	modelResponsesAPI bool
 	// providerName is the registry id this client serves. One Client type backs
 	// every OpenAI-shaped provider (zai, deepseek, copilot, openrouter, ollama,
 	// …), so provider-boundary errors — the idle-stall message above all — must
@@ -413,11 +442,12 @@ func NewClient(cfg Config) (*Client, error) {
 	}
 
 	return &Client{
-		client:          &client,
-		model:           cfg.Model,
-		quirks:          quirks,
-		maxOutputTokens: cfg.MaxOutputTokens,
-		providerName:    "openai",
+		client:            &client,
+		model:             cfg.Model,
+		quirks:            quirks,
+		maxOutputTokens:   cfg.MaxOutputTokens,
+		modelResponsesAPI: modelIDInSet(quirks.ResponsesAPIModelIDs, cfg.Model),
+		providerName:      "openai",
 	}, nil
 }
 
@@ -492,11 +522,23 @@ func IsResponsesAPIModel(model string) bool {
 	return GPTGeneration(model) >= responsesAPIGeneration
 }
 
+// modelIDInSet reports whether a model id is in a descriptor's id set,
+// comparing lowercased and trimmed so a configured id that differs only in case
+// or padding still matches — the same normalisation the providers' own model
+// filters use.
+func modelIDInSet(set map[string]bool, model string) bool {
+	if len(set) == 0 {
+		return false
+	}
+	return set[strings.ToLower(strings.TrimSpace(model))]
+}
+
 // usesResponsesAPI reports whether this client's calls route through the
-// Responses API rather than Chat Completions — either because the model id
-// requires it or because the ForceResponsesAPI quirk is set.
+// Responses API rather than Chat Completions — because the model id requires it,
+// because the descriptor lists this id in ResponsesAPIModelIDs, or because the
+// ForceResponsesAPI quirk is set.
 func (c *Client) usesResponsesAPI() bool {
-	return c.quirks.ForceResponsesAPI || IsResponsesAPIModel(c.model)
+	return c.quirks.ForceResponsesAPI || c.modelResponsesAPI || IsResponsesAPIModel(c.model)
 }
 
 // convertToolsToResponsesAPI converts provider.ToolDefinition to Responses API tool format
@@ -734,10 +776,12 @@ func promptCacheKey(req provider.MessageRequest) string {
 // sessionAffinityID derives a stable UUID-shaped session id from the
 // conversation id, for the SessionAffinityHeader quirk. Deterministic (a
 // hash, not a random UUID) so the same conversation presents the same
-// session_id across turns, threads, and app restarts — a value that changed
+// session id across turns, threads, and app restarts — a value that changed
 // on restart would lose replica affinity and cold-miss the whole prefix.
-// UUID-shaped because that is what the Codex CLI sends; "" (no conversation
-// id) sends no header, keeping conv-less unit-test requests byte-stable.
+// UUID-shaped because that is what the Codex CLI sends; the OpenCode Go
+// gateway accepts the same shape (probed 2026-09-27), so one derivation
+// serves both. "" (no conversation id) sends no header, keeping conv-less
+// unit-test requests byte-stable.
 func sessionAffinityID(convID string) string {
 	if convID == "" {
 		return ""
@@ -747,6 +791,22 @@ func sessionAffinityID(convID string) string {
 	b[6] = (b[6] & 0x0f) | 0x40 // version 4 bits
 	b[8] = (b[8] & 0x3f) | 0x80 // RFC 4122 variant bits
 	return fmt.Sprintf("%x-%x-%x-%x-%x", b[0:4], b[4:6], b[6:8], b[8:10], b[10:16])
+}
+
+// sessionAffinityOption returns the option carrying this conversation's stable
+// session id under the quirk's header name, ok=false when the quirk is off or
+// the request carries no conversation id — a conv-less request must stay
+// byte-identical, which is what keeps conv-less unit requests unchanged.
+func (c *Client) sessionAffinityOption(req provider.MessageRequest) (option.RequestOption, bool) {
+	name := c.quirks.SessionAffinityHeader
+	if name == "" {
+		return nil, false
+	}
+	sid := sessionAffinityID(req.ConversationID)
+	if sid == "" {
+		return nil, false
+	}
+	return option.WithHeader(name, sid), true
 }
 
 // streamMessageResponses uses the Responses API for models that need it.
@@ -835,13 +895,12 @@ func (c *Client) streamMessageResponses(ctx context.Context, req provider.Messag
 			option.WithJSONSet("stream", true),
 		)
 	}
-	// Cache-affinity routing: the backend pins consecutive requests for the
-	// same session_id to the replica holding their prompt cache. See the
-	// quirk's doc comment for the measured effect.
-	if c.quirks.SessionAffinityHeader {
-		if sid := sessionAffinityID(req.ConversationID); sid != "" {
-			opts = append(opts, option.WithHeader("session_id", sid))
-		}
+	// Cache-affinity / gateway session routing: the header pins consecutive
+	// requests for the same conversation to the replica holding their prompt
+	// cache (Codex) or is required outright (OpenCode Go). See the quirk's doc
+	// comment for the measured effect.
+	if opt, ok := c.sessionAffinityOption(req); ok {
+		opts = append(opts, opt)
 	}
 	// Provider-boundary liveness: guard the SDK stream (no read deadline of its
 	// own) with an idle watchdog that cancels streamCtx if the upstream goes
@@ -1554,7 +1613,15 @@ func (c *Client) streamMessageChatCompletions(ctx context.Context, req provider.
 	sess, streamCtx := utils.NewStreamSession(ctx, c.providerName, callback)
 	defer sess.Close()
 
-	stream := c.client.Chat.Completions.NewStreaming(streamCtx, params, option.WithJSONSet(c.quirks.MaxTokensParamName, maxTokens))
+	// opts carries the output-cap param plus, when the quirk names one, the
+	// per-conversation session header (OpenCode Go refuses the request without
+	// it). See sessionAffinityOption.
+	opts := []option.RequestOption{option.WithJSONSet(c.quirks.MaxTokensParamName, maxTokens)}
+	if opt, ok := c.sessionAffinityOption(req); ok {
+		opts = append(opts, opt)
+	}
+
+	stream := c.client.Chat.Completions.NewStreaming(streamCtx, params, opts...)
 
 	// Track tool calls being assembled (OpenAI streams them incrementally)
 	toolCallBuffers := make(map[int]*toolCallAccumulator)

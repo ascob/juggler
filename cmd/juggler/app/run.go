@@ -43,6 +43,7 @@ import (
 	"juggler/cmd/juggler/providers/ollama"
 	"juggler/cmd/juggler/providers/openai"
 	"juggler/cmd/juggler/providers/openaicodex"
+	"juggler/cmd/juggler/providers/opencodego"
 	"juggler/cmd/juggler/providers/opencodezen"
 	"juggler/cmd/juggler/providers/openrouter"
 	"juggler/cmd/juggler/providers/streamidle"
@@ -236,6 +237,7 @@ func registerProviders() {
 	ollama.Register()
 	openai.Register()
 	openaicodex.Register()
+	opencodego.Register()
 	opencodezen.Register()
 	openrouter.Register()
 	zai.Register()

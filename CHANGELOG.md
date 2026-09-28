@@ -5,6 +5,9 @@ of changes; this project follows semantic versioning.
 
 ## [Unreleased]
 
+- Added OpenCode Go provider for the models the gateway serves, with its own key entry
+- OpenCode Go now shows its 5-hour, weekly and monthly usage where the model is chosen
+
 ## [0.7.1] - 2026-09-27
 
 - Fixes for conversation dragging order when workspaces are there, and for conversation flashing colours

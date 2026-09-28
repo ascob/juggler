@@ -20,6 +20,7 @@ import (
 	"juggler/cmd/juggler/providers/ollama"
 	"juggler/cmd/juggler/providers/openai"
 	"juggler/cmd/juggler/providers/openaicodex"
+	"juggler/cmd/juggler/providers/opencodego"
 	"juggler/cmd/juggler/providers/opencodezen"
 	"juggler/cmd/juggler/providers/openrouter"
 	"juggler/cmd/juggler/providers/provider"
@@ -46,6 +47,7 @@ func registerCatalogProviders() {
 	ollama.Register()
 	openai.Register()
 	openaicodex.Register()
+	opencodego.Register()
 	opencodezen.Register()
 	openrouter.Register()
 	zai.Register()
@@ -109,6 +111,39 @@ func TestCatalogInvariants(t *testing.T) {
 		t.Fatal("no catalogued models were checked — the provider registration list is not doing anything")
 	}
 	t.Logf("checked %d catalogued models", checked)
+}
+
+// TestProviderConfigKeysAreUnique pins that no two providers read their API key
+// from the same credentials entry.
+//
+// The entry is not only storage: it is the address of the settings field and of
+// the delete action, both of which name a provider's key by ConfigKeyName. Two
+// providers sharing one would look like two independent rows while editing one
+// secret — deleting a key in either row uncredentials the other, with no error
+// anywhere to say why the model stopped working. Providers with no key (OAuth,
+// keyless toggles) are skipped: an empty name is how they say so.
+func TestProviderConfigKeysAreUnique(t *testing.T) {
+	registerCatalogProviders()
+
+	owner := make(map[string]string)
+	checked := 0
+	for _, info := range provider.ListProviderInfos() {
+		if info.ConfigKeyName == "" {
+			continue
+		}
+		checked++
+		if prev, dup := owner[info.ConfigKeyName]; dup {
+			t.Errorf("%s and %s both read their key from %q — deleting it for one deletes it for the other",
+				prev, info.Name, info.ConfigKeyName)
+			continue
+		}
+		owner[info.ConfigKeyName] = info.Name
+	}
+
+	if checked == 0 {
+		t.Fatal("no providers with a key entry were checked — registration is not doing anything")
+	}
+	t.Logf("checked %d provider key entries", checked)
 }
 
 // TestCheapModelHintsNameACataloguedModel checks each provider's cheap-model

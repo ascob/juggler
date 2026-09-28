@@ -267,6 +267,7 @@ Juggler talks to models through pluggable providers. The built-in set is:
 - **Z.AI GLM**
 - **OpenRouter**
 - **OpenCode Zen**
+- **OpenCode Go**
 - **ACP Agents** (external agents speaking the Agent Client Protocol)
 - **Ollama (local)**, **llama.cpp (local)** and **LocalAI (local)**
 

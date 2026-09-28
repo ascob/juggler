@@ -62,7 +62,7 @@ func Register() {
 			ForceResponsesAPI:            true,
 			OmitResponsesMaxOutputTokens: true,
 			ForcedToolChoiceSupported:    true,
-			SessionAffinityHeader:        true,
+			SessionAffinityHeader:        "session_id",
 		},
 	})
 }
